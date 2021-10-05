@@ -689,7 +689,7 @@ class TemplateAdaptor(Adaptor):
                 q_capability['optypewise'][q_op[1]] = copy.deepcopy(capability[q_op[1]]) \
                     if q_op[1] in capability.keys() else copy.deepcopy(capability['default'])
 
-        return q_capability
+        return q_capability, None, None
 
 
 unify_op_type_mapping = {

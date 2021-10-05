@@ -176,7 +176,7 @@ class TuneStrategy(object):
         objective = self.cfg.tuning.objective.lower()
         self.objective = OBJECTIVES[objective](self.cfg.tuning.accuracy_criterion)
 
-        self.capability = self.adaptor.query_fw_capability(model)
+        self.capability, _, _ = self.adaptor.query_fw_capability(model)
         self.graph_optimization_mode = bool('graph_optimization' in self.cfg)
 
         self.modelwise_tune_space = conf.modelwise_tune_space(self.capability['optypewise'])

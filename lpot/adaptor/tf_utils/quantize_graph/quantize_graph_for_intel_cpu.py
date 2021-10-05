@@ -18,13 +18,17 @@
 from tensorflow.core.framework import graph_pb2
 from tensorflow.python.platform import gfile
 from lpot.utils.utility import dump_elapsed_time
+from .quantize_graph_base import add_q_dq_before_elementwise
+from .quantize_graph_base import merge_redundant_quantization
 
 from .quantize_graph_base import QuantizeGraphBase
+from .quantize_graph_base import remove_redundant_quantization
 from .quantize_graph_common import QuantizeGraphHelper
 from .quantize_graph_conv import FuseNodeStartWithConv2d
 from .quantize_graph_concatv2 import FuseNodeStartWithConcatV2
 from .quantize_graph_matmul import FuseNodeStartWithMatmul
 from .quantize_graph_pooling import FuseNodeStartWithPooling
+
 
 class QuantizeGraphForIntel(QuantizeGraphBase):
     """
@@ -71,27 +75,71 @@ class QuantizeGraphForIntel(QuantizeGraphBase):
 
     @dump_elapsed_time("Pass Quantization")
     def do_transform(self):
-        count = 0
+#        count = 0
         remove_redundant_quant_flag = False
-        all_node_length = len(self.op_wise_config)
-        for _, node in enumerate(self.input_graph.node):
+#        all_node_length = len(self.op_wise_config)
+        for idx, node in enumerate(self.input_graph.node):
             if node in self.input_graph.node and node.op in self.transformers \
                 and node.name in self.op_wise_config:
-                count += 1
-                if count == all_node_length:
-                    remove_redundant_quant_flag = True
+                # count += 1
+                # if count == all_node_length:
+                #     remove_redundant_quant_flag = True
 
-                self.input_graph, quantizable_node_names = self.transformers[node.op](
+                transformer = self.transformers[node.op](
                     input_graph=self.input_graph,
                     patterns=self.op_wise_seq[node.op],
                     remove_redundant_quant_flag=remove_redundant_quant_flag,
                     op_wise_cfg=self.op_wise_config[node.name],
-                    start_node_name=node.name, device=self.device, \
-                    fake_quant=self.fake_quant).apply_the_transform()
+                    start_node_name=node.name, device=self.device,
+                    fake_quant=self.fake_quant)
+
+                self.input_graph, quantizable_node_names = transformer.apply_the_transform()
+
+                # self.input_graph = self.remove_dead_nodes(self.input_graph, self.output_node_names)
+                #
+                # str_idx = str(idx).zfill(3)
+                # import tensorflow as tf
+                # tf.io.write_graph(
+                #     self.input_graph,
+                #     '/home/alexsu/work/projects/algo/nncf_tf/source/nncf-tf/lpot/examples/tensorflow/qat',
+                #     f'do_quantize_{str_idx}.pb',
+                #     as_text=False)
+
                 if quantizable_node_names:
                     if node.op in ('ConcatV2', 'MaxPool', 'AvgPool'):
                         self.all_quantizable_node.extend([[i] for i in quantizable_node_names])
                     else:
                         self.all_quantizable_node.append(quantizable_node_names)
-        return self.remove_dead_nodes(self.input_graph, self.output_node_names), \
-            self.all_quantizable_node
+
+                #Debug
+                #break
+
+        self.input_graph = remove_redundant_quantization(self.input_graph, self.fake_quant)
+        self.input_graph = self.remove_dead_nodes(self.input_graph, self.output_node_names)
+
+        import tensorflow as tf
+        tf.io.write_graph(
+            self.input_graph,
+            '/home/alexsu/work/projects/algo/nncf_tf/source/nncf-tf/lpot/examples/tensorflow/qat',
+            'remove_redundant_quantization.pb',
+            as_text=False)
+
+
+        self.input_graph = add_q_dq_before_elementwise(self.input_graph)
+
+        tf.io.write_graph(
+            self.input_graph,
+            '/home/alexsu/work/projects/algo/nncf_tf/source/nncf-tf/lpot/examples/tensorflow/qat',
+            'q_dq_add.pb',
+            as_text=False)
+
+        self.input_graph = merge_redundant_quantization(self.input_graph)
+        self.input_graph = self.remove_dead_nodes(self.input_graph, self.output_node_names)
+
+        tf.io.write_graph(
+            self.input_graph,
+            '/home/alexsu/work/projects/algo/nncf_tf/source/nncf-tf/lpot/examples/tensorflow/qat',
+            'merge_redundant_quantization.pb',
+            as_text=False)
+
+        return self.input_graph, self.all_quantizable_node

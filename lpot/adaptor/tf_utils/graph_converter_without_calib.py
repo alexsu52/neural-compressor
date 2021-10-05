@@ -303,8 +303,8 @@ class GraphConverterWithoutCalib:
             self._tmp_graph_def,
             protected_nodes=self._tmp_model.output_node_names).do_transformation()
 
-        self._tmp_graph_def = FoldBatchNormNodesOptimizer(
-            self._tmp_graph_def).do_transformation()
+        # self._tmp_graph_def = FoldBatchNormNodesOptimizer(
+        #     self._tmp_graph_def).do_transformation()
 
         if 'scale_propagation_concat' in self.recipes and self.recipes['scale_propagation_concat']:
             self._tmp_graph_def = RerangeQuantizedConcat(self._tmp_graph_def,

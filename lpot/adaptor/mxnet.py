@@ -215,7 +215,7 @@ class MxNetAdaptor(Adaptor):
             op_type_wise.setdefault(optype, op_capability)
             op_wise.setdefault((node['name'], node['type']), op_capability)
 
-        return {'optypewise': op_type_wise, 'opwise': op_wise}
+        return {'optypewise': op_type_wise, 'opwise': op_wise}, None, None
 
     def _inspect_tensor(self, lpot_model, data_x, node_list=[], iteration_list=[]):
         def b_filter():

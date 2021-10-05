@@ -475,6 +475,22 @@ class TensorFlowAdaptor(Adaptor):
                 self.quantize_config['op_wise_config'][node_name] = (False, "minmax", False)
         return self.quantizable_op_details
 
+    def collect_biasadd_values(self, graph_def):
+        import tensorflow as tf
+
+        graph = tf.Graph()
+        with graph.as_default():
+            tf.import_graph_def(graph_def, name='')
+
+        sess = tf.compat.v1.Session(graph=graph)
+
+        biasadds = {}
+        with sess.as_default():
+            for op in graph.get_operations():
+                if op.type == 'BiasAdd':
+                    biasadds[op.inputs[0].op.name] = op.inputs[1].eval()
+        return biasadds
+
     def query_fw_capability(self, model):
         """Collect the model-wise and op-wise configuration for quantization.
 
@@ -488,7 +504,10 @@ class TensorFlowAdaptor(Adaptor):
 
         self.pre_optimizer_handle = PreOptimization(model, self.optimization)
 
-        self.pre_optimized_model = self.pre_optimizer_handle.get_optimized_model()
+        self.pre_optimized_model, fold_batchnorm_scales = self.pre_optimizer_handle.get_optimized_model()
+
+        bias_adds = self.collect_biasadd_values(self.pre_optimized_model.graph_def)
+
         model.graph_def = self.pre_optimized_model.graph_def
 
         self.exclude_node_names = self.pre_optimizer_handle.get_excluded_node_names()
@@ -523,7 +542,7 @@ class TensorFlowAdaptor(Adaptor):
         logger.debug("Dump framework quantization capability:")
         logger.debug(capability)
 
-        return capability
+        return capability, fold_batchnorm_scales, bias_adds
 
     def set_tensor(self, model, tensor_dict):
         from .tf_utils.graph_rewriter.graph_util import GraphAnalyzer
@@ -773,6 +792,88 @@ class TensorFlowAdaptor(Adaptor):
     def save(self, model, path):
         pass
 
+    def analyze_qat_model(self, model):
+        import tensorflow as tf
+
+        input_signature = []
+        for name, input in zip(model.input_names, model.inputs):
+            input_signature.append(tf.TensorSpec(input.shape, input.dtype, name))
+        concrete_function = tf.function(model).get_concrete_function(input_signature)
+        from tensorflow.python.framework.convert_to_constants import convert_variables_to_constants_v2
+        frozen_func = convert_variables_to_constants_v2(concrete_function, lower_control_flow=False)
+        frozen_graph = frozen_func.graph
+
+        sess = tf.compat.v1.Session(graph=frozen_graph)
+
+        qat_model_parameters = {}
+        qat_model_parameters['graph'] = frozen_graph
+        qat_model_parameters['sess'] = sess
+
+        with sess.as_default():
+            fq_weights = {}
+            conv_weights = {}
+            mat_weights = {}
+            for op in frozen_graph.get_operations():
+                if op.type == 'FakeQuantWithMinMaxVars':
+                    consumer = op.outputs[0].consumers()
+                    if len(consumer) > 1:
+                        continue
+                    if consumer[0].type in ['Conv2D', 'MatMul']:
+                        if consumer[0].inputs[1].name == op.outputs[0].name:
+                            fq_weights[consumer[0].name] = {
+                                'min': op.inputs[1].eval(),
+                                'max': op.inputs[2].eval(),
+                            }
+                if op.type == 'Conv2D':
+                    conv_weights[op.name] = op.inputs[1].eval()
+
+                if op.type == 'MatMul':
+                    mat_weights[op.name] = op.inputs[1].eval()
+
+            qat_model_parameters['fq_weights'] = fq_weights
+            qat_model_parameters['conv_weights'] = conv_weights
+            qat_model_parameters['mat_weights'] = mat_weights
+
+        from tensorflow.python.training import saver
+        from tensorflow.core.protobuf import config_pb2
+        from tensorflow.python.grappler import tf_optimizer
+        from tensorflow.core.protobuf import meta_graph_pb2
+        graph_def = frozen_graph.as_graph_def()
+        output_names = [output.split(':')[0] for output in model.output_names]
+        # replace the output name with squential
+        for output_name in output_names:
+            for node in graph_def.node[::-1]:
+                if node.op == 'Identity' and output_name in node.input[0]:
+                    node.name = output_name
+                    break
+
+        grappler_meta_graph_def = saver.export_meta_graph(
+            graph_def=graph_def, graph=frozen_graph)
+
+        # Add a collection 'train_op' so that Grappler knows the outputs.
+        fetch_collection = meta_graph_pb2.CollectionDef()
+        for array in model.output_names:
+            fetch_collection.node_list.value.append(array)
+        grappler_meta_graph_def.collection_def["train_op"].CopyFrom(
+            fetch_collection)
+        grappler_session_config = config_pb2.ConfigProto()
+        rewrite_options = grappler_session_config.graph_options.rewrite_options
+        for item in ['pruning', 'shape', 'dependency', 'debug_stripper', 'loop', 'constfold', 'arithmetic']:
+            rewrite_options.optimizers.append(item)
+        rewrite_options.min_graph_nodes = -1
+        const_fold_graph_def = tf_optimizer.OptimizeGraph(grappler_session_config,
+                                                          grappler_meta_graph_def, graph_id=b"tf_graph")
+
+        qat_model_parameters['const_fold_graph_def'] = const_fold_graph_def
+
+        tf.io.write_graph(
+            const_fold_graph_def,
+            '/home/alexsu/work/projects/algo/nncf_tf/source/nncf-tf/lpot/examples/tensorflow/qat',
+            'fp32_const_fold_graph_def.pb',
+            as_text=False)
+
+        return qat_model_parameters
+
     def convert(self, model, source, destination):
         '''The function is used to convert a source model format to another.
 
@@ -782,7 +883,13 @@ class TensorFlowAdaptor(Adaptor):
                destination (string): The destination model format.
         '''
         assert source.lower() == 'qat' and destination.lower() == 'default'
-        capability = self.query_fw_capability(model)
+
+        qat_model_parameters = self.analyze_qat_model(model._model)
+
+        capability, fold_batchnorm_scales, bias_adds = self.query_fw_capability(model)
+
+        qat_model_parameters['scales'] = fold_batchnorm_scales
+        qat_model_parameters['bias_adds'] = bias_adds
 
         quantize_config = {'op_wise_config': {}}
         for each_op_info in capability['opwise']:
@@ -794,8 +901,8 @@ class TensorFlowAdaptor(Adaptor):
             activation = capability['optypewise'][op_type]['activation']
             if 'weight' in capability['optypewise'][op_type]:
                 weight = capability['optypewise'][op_type]['weight']
-                is_perchannel = True if weight[
-                    'granularity'][0] == 'per_channel' else False
+#                is_perchannel = True if weight[
+#                    'granularity'][0] == 'per_channel' else False
 
             algorithm = activation['algorithm'][0]
 
@@ -811,7 +918,8 @@ class TensorFlowAdaptor(Adaptor):
         converter = GraphConverter(model,
                                    qt_config=quantize_config,
                                    int8_sequences=self.op_wise_sequences,
-                                   fake_quant=True)
+                                   fake_quant=True,
+                                   qat_model_parameters=qat_model_parameters)
 
         return converter.convert()
 
@@ -829,7 +937,7 @@ class TensorFlowAdaptor(Adaptor):
         """
         from .tf_utils.graph_rewriter.generic.pre_optimize import PreOptimization
         self.pre_optimizer_handle = PreOptimization(model, self.optimization)
-        self.pre_optimized_model = self.pre_optimizer_handle.get_optimized_model()
+        self.pre_optimized_model, _ = self.pre_optimizer_handle.get_optimized_model()
         model.graph_def = self.pre_optimized_model.graph_def
 
         from .tf_utils.graph_converter_without_calib import GraphConverterWithoutCalib

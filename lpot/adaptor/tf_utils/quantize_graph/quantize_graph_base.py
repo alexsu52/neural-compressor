@@ -25,6 +25,224 @@ from tensorflow.python.framework import dtypes
 from .quantize_graph_common import QuantizeGraphHelper as helper
 
 
+def create_nodes_map(graph):
+    """Builds a mapping of node names to their defs from the graph."""
+    nodes_map = {}
+    for node in graph.node:
+        assert node.name not in nodes_map, "Duplicate node names detected."
+        nodes_map[node.name] = node
+
+    return nodes_map
+
+
+def add_output_graph_node(output_graph, output_node_maps, output_node):
+    """Inserts one node into the new graph."""
+    assert output_node.name not in output_node_maps
+    output_node_maps[output_node.name] = output_node
+    output_graph.node.extend([output_node])
+
+
+def create_quantize_node(node_name, postfix, output_graph, output_node_maps, input_node_name):
+    quantize_node_name = node_name + "_quantize_" + postfix
+    min_input_name = quantize_node_name + "_min"
+    min_node = helper.create_constant_node(
+        min_input_name, -1., dtypes.float32)
+    add_output_graph_node(output_graph, output_node_maps, min_node)
+    max_input_name = quantize_node_name + "_max"
+    max_node = helper.create_constant_node(
+        max_input_name, 1., dtypes.float32)
+    add_output_graph_node(output_graph, output_node_maps, max_node)
+    quantize_input_node = helper.create_node(
+        "QuantizeV2", quantize_node_name,
+        [input_node_name, min_input_name, max_input_name])
+
+    helper.set_attr_dtype(quantize_input_node, "T", tf.dtypes.quint8)
+    helper.set_attr_string(quantize_input_node, "mode", b"SCALED")
+    helper.set_attr_string(quantize_input_node, "round_mode", b"HALF_TO_EVEN")
+    add_output_graph_node(output_graph, output_node_maps, quantize_input_node)
+
+    min_output_name = quantize_node_name + ":1"
+    max_output_name = quantize_node_name + ":2"
+
+    return quantize_node_name, min_output_name, max_output_name
+
+
+def create_dequantize_node(node_name, postfix, output_graph, output_node_maps, input, input_min, input_max):
+    dequantize_node_name = node_name + "_dequantize_" + postfix
+
+    dequantize_node = helper.create_node(
+        "Dequantize", dequantize_node_name,
+        [input, input_min, input_max])
+    helper.set_attr_dtype(dequantize_node, "T", tf.dtypes.quint8)
+    helper.set_attr_string(dequantize_node, "mode",b"SCALED")
+    add_output_graph_node(output_graph, output_node_maps, dequantize_node)
+
+    return dequantize_node_name
+
+
+def add_q_dq_before_elementwise(old_graph):
+    output_node_maps = {}
+    inputs_to_rename = {}
+    old_nodes_map = create_nodes_map(old_graph)
+    output_graph = graph_pb2.GraphDef()
+
+    for node in old_graph.node:
+        if node.op not in ["Add", "AddV2"]:
+            continue
+
+        input_name_0 = helper.node_name_from_input(node.input[0])
+        input_node_0 = old_nodes_map[input_name_0]
+        if input_node_0.op != "Dequantize":
+            quantize_node_name, min_output_name, max_output_name = create_quantize_node(
+                node.name, '0', output_graph, output_node_maps, node.input[0])
+            dequantize_node_name = create_dequantize_node(node.name, '0', output_graph, output_node_maps,
+                                                          quantize_node_name, min_output_name, max_output_name)
+            input_name = helper.ensure_tensor_name_has_port(node.input[0])
+            inputs_to_rename[input_name] = dequantize_node_name
+
+        input_name_1 = helper.node_name_from_input(node.input[1])
+        input_node_1 = old_nodes_map[input_name_1]
+        if input_node_1.op != "Dequantize":
+            quantize_node_name, min_output_name, max_output_name = create_quantize_node(node.name, '1', output_graph,
+                                                                                        output_node_maps, node.input[1])
+            dequantize_node_name = create_dequantize_node(node.name, '1', output_graph, output_node_maps,
+                                                          quantize_node_name, min_output_name, max_output_name)
+
+            input_name = helper.ensure_tensor_name_has_port(node.input[1])
+            inputs_to_rename[input_name] = dequantize_node_name
+    # Finally we apply all the rewiring we've marked to the graph.
+    for node in old_graph.node:
+        for index, input_full_name in enumerate(node.input):
+            input_name = helper.ensure_tensor_name_has_port(
+                input_full_name)
+            if node.op in ["Add", "AddV2"] and input_name in inputs_to_rename:
+                node.input[index] = inputs_to_rename[input_name]
+        add_output_graph_node(output_graph, output_node_maps, node)
+    return output_graph
+
+
+def merge_redundant_quantization(old_graph):
+    output_node_maps = {}
+    mergeable_nodes = {}
+    inputs_to_rename = {}
+    output_graph = graph_pb2.GraphDef()
+
+    for node in old_graph.node:
+        if node.op not in ["Quantize", "QuantizeV2"]:
+            continue
+        input_node_name = helper.node_name_from_input(node.input[0])
+        if input_node_name in mergeable_nodes:
+            src_node_name = mergeable_nodes[input_node_name]
+            src_min_tensor_name = src_node_name + ":1"
+            src_max_tensor_name = src_node_name + ":2"
+
+            dst_node_name = node.name
+            dst_tensor_name = helper.ensure_tensor_name_has_port(dst_node_name)
+            dst_min_tensor_name = dst_node_name + ":1"
+            dst_max_tensor_name = dst_node_name + ":2"
+
+            inputs_to_rename[dst_tensor_name] = src_node_name
+            inputs_to_rename[dst_min_tensor_name] = src_min_tensor_name
+            inputs_to_rename[dst_max_tensor_name] = src_max_tensor_name
+        else:
+            mergeable_nodes[input_node_name] = node.name
+    # Finally we apply all the rewiring we've marked to the graph.
+    for node in old_graph.node:
+        for index, input_full_name in enumerate(node.input):
+            input_name = helper.ensure_tensor_name_has_port(
+                input_full_name)
+            if input_name in inputs_to_rename:
+                node.input[index] = inputs_to_rename[input_name]
+        add_output_graph_node(output_graph, output_node_maps, node)
+    return output_graph
+
+
+def remove_redundant_quantization(old_graph, fake_quant, logger=None):
+    output_node_maps = {}
+    old_nodes_map = create_nodes_map(old_graph)
+    output_graph = graph_pb2.GraphDef()
+    inputs_to_rename = {}
+    # We go through all the nodes, looking for any that match the patterns we
+    # know how to optimize away.
+    for node in old_graph.node:
+        # We always start with a Quantize node, and examine its inputs to see if
+        # they are in a form that can be removed.
+        if node.op not in ["Quantize", "QuantizeV2"]:
+            continue
+
+        dequantize_node_name = helper.node_name_from_input(node.input[0])
+
+        assert dequantize_node_name in old_nodes_map, "Input node name '" + \
+            dequantize_node_name + "' not found in node '" + node.name + "'"
+
+        dequantize_node = old_nodes_map[dequantize_node_name]
+        # Do we have a Dequantize feeding in, with the same type as the
+        # Quantize?
+        if dequantize_node.op != "Dequantize":
+            continue
+
+        if node.attr["T"] != dequantize_node.attr["T"]:
+            continue
+
+        if not fake_quant:
+            # Now look at the other inputs, and ensure they're Min/Max nodes.
+            min_node_name = helper.node_name_from_input(node.input[1])
+            max_node_name = helper.node_name_from_input(node.input[2])
+            min_node = old_nodes_map[min_node_name]
+            max_node = old_nodes_map[max_node_name]
+            is_min_right_type = (min_node.op in ["Min", "Dequantize"])
+            is_max_right_type = (max_node.op in ["Max", "Dequantize"])
+            if not is_min_right_type or not is_max_right_type:
+                logger.info("Not find expected types on inputs {}, {}.".
+                                 format(min_node.op, max_node.op))
+                continue
+            min_node_input_name = helper.node_name_from_input(
+                min_node.input[0])
+            max_node_input_name = helper.node_name_from_input(
+                max_node.input[0])
+            # There are two different patterns for Min nodes we can recognize, one
+            # where the input comes directly from the same one as the Max, and
+            # another where we run it through another Min first, so check for
+            # both.
+            is_same_input = False
+            if min_node_input_name == max_node_input_name:
+                is_same_input = True
+            else:
+                first_min_node_input = old_nodes_map[min_node_input_name]
+                if first_min_node_input.op == "Concat":
+                    second_min_node_name = helper.node_name_from_input(
+                        first_min_node_input.input[1])
+                    second_min_node = old_nodes_map[second_min_node_name]
+                    if second_min_node.op == "Min":
+                        second_min_node_input_name = helper.node_name_from_input(
+                            second_min_node.input[0])
+                        is_same_input = (
+                            second_min_node_input_name == max_node_input_name)
+            if not is_same_input:
+                logger.info("Different min/max inputs {}.".format(min_node_input_name))
+                continue
+        # We recognize this pattern, so mark the graph edges to be rewired to
+        # route around it entirely, since we know it's a no-op.
+        dequantize_source_name = helper.node_name_from_input(
+            dequantize_node.input[0])
+        node_tensor_name = helper.ensure_tensor_name_has_port(node.name)
+        min_tensor_name = node.name + ":1"
+        max_tensor_name = node.name + ":2"
+
+        inputs_to_rename[node_tensor_name] = dequantize_source_name
+        inputs_to_rename[min_tensor_name] = dequantize_node.input[1]
+        inputs_to_rename[max_tensor_name] = dequantize_node.input[2]
+    # Finally we apply all the rewiring we've marked to the graph.
+    for node in old_graph.node:
+        for index, input_full_name in enumerate(node.input):
+            input_name = helper.ensure_tensor_name_has_port(
+                input_full_name)
+            if input_name in inputs_to_rename:
+                node.input[index] = inputs_to_rename[input_name]
+        add_output_graph_node(output_graph, output_node_maps, node)
+    return output_graph
+
+
 class QuantizeGraphBase():
     """
     This is the base class for quantize graph.
@@ -356,88 +574,9 @@ class QuantizeNodeBase():
                 self.node_name_mapping[helper.node_name_from_input(each_input)].output.\
                     append(node_name)
 
+
     def remove_redundant_quantization(self, old_graph):
-        old_nodes_map = self.create_nodes_map(old_graph)
-        self.output_graph = graph_pb2.GraphDef()
-        inputs_to_rename = {}
-        # We go through all the nodes, looking for any that match the patterns we
-        # know how to optimize away.
-        for node in old_graph.node:
-            # We always start with a Quantize node, and examine its inputs to see if
-            # they are in a form that can be removed.
-            if node.op not in ["Quantize", "QuantizeV2"]:
-                continue
-
-            dequantize_node_name = helper.node_name_from_input(node.input[0])
-
-            assert dequantize_node_name in old_nodes_map, "Input node name '" + \
-                dequantize_node_name + "' not found in node '" + node.name + "'"
-
-            dequantize_node = old_nodes_map[dequantize_node_name]
-            # Do we have a Dequantize feeding in, with the same type as the
-            # Quantize?
-            if dequantize_node.op != "Dequantize":
-                continue
-
-            if node.attr["T"] != dequantize_node.attr["T"]:
-                continue
-
-            # Now look at the other inputs, and ensure they're Min/Max nodes.
-            min_node_name = helper.node_name_from_input(node.input[1])
-            max_node_name = helper.node_name_from_input(node.input[2])
-            min_node = old_nodes_map[min_node_name]
-            max_node = old_nodes_map[max_node_name]
-            is_min_right_type = (min_node.op in ["Min", "Dequantize"])
-            is_max_right_type = (max_node.op in ["Max", "Dequantize"])
-            if not is_min_right_type or not is_max_right_type:
-                self.logger.info("Not find expected types on inputs {}, {}.".
-                                 format(min_node.op, max_node.op))
-                continue
-            min_node_input_name = helper.node_name_from_input(
-                min_node.input[0])
-            max_node_input_name = helper.node_name_from_input(
-                max_node.input[0])
-            # There are two different patterns for Min nodes we can recognize, one
-            # where the input comes directly from the same one as the Max, and
-            # another where we run it through another Min first, so check for
-            # both.
-            is_same_input = False
-            if min_node_input_name == max_node_input_name:
-                is_same_input = True
-            else:
-                first_min_node_input = old_nodes_map[min_node_input_name]
-                if first_min_node_input.op == "Concat":
-                    second_min_node_name = helper.node_name_from_input(
-                        first_min_node_input.input[1])
-                    second_min_node = old_nodes_map[second_min_node_name]
-                    if second_min_node.op == "Min":
-                        second_min_node_input_name = helper.node_name_from_input(
-                            second_min_node.input[0])
-                        is_same_input = (
-                            second_min_node_input_name == max_node_input_name)
-            if not is_same_input:
-                self.logger.info("Different min/max inputs {}.".format(min_node_input_name))
-                continue
-            # We recognize this pattern, so mark the graph edges to be rewired to
-            # route around it entirely, since we know it's a no-op.
-            dequantize_source_name = helper.node_name_from_input(
-                dequantize_node.input[0])
-            node_tensor_name = helper.ensure_tensor_name_has_port(node.name)
-            min_tensor_name = node.name + ":1"
-            max_tensor_name = node.name + ":2"
-
-            inputs_to_rename[node_tensor_name] = dequantize_source_name
-            inputs_to_rename[min_tensor_name] = dequantize_node.input[1]
-            inputs_to_rename[max_tensor_name] = dequantize_node.input[2]
-        # Finally we apply all the rewiring we've marked to the graph.
-        for node in old_graph.node:
-            for index, input_full_name in enumerate(node.input):
-                input_name = helper.ensure_tensor_name_has_port(
-                    input_full_name)
-                if input_name in inputs_to_rename:
-                    node.input[index] = inputs_to_rename[input_name]
-            self.add_output_graph_node(node)
-        return self.output_graph
+        return remove_redundant_quantization(old_graph, self.fake_quant, self.logger)
 
     def create_nodes_map(self, graph):
         """Builds a mapping of node names to their defs from the graph."""

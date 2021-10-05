@@ -84,6 +84,14 @@ class PreOptimization():
         origin_model.input_tensor_names = self.model.input_tensor_names
         origin_model.workspace_path = self.model.workspace_path
 
+        #Debug
+        import tensorflow as tf
+        tf.io.write_graph(
+            self.model.graph_def,
+            '/home/alexsu/work/projects/algo/nncf_tf/source/nncf-tf/lpot/examples/tensorflow/qat',
+            'fp32_pre_optimized_model.pb',
+            as_text=False)
+
         output_node_names = self.model.output_node_names
         input_node_names = self.model.input_node_names
 
@@ -109,7 +117,7 @@ class PreOptimization():
 
         self._tmp_graph_def = GraphCseOptimizer(self._tmp_graph_def).do_transformation()
 
-        self._tmp_graph_def = FoldBatchNormNodesOptimizer(
+        self._tmp_graph_def, fold_batchnorm_scales = FoldBatchNormNodesOptimizer(
             self._tmp_graph_def).do_transformation()
 
         #TODO we should handle all control ops elegantly not bypass it.
@@ -138,7 +146,14 @@ class PreOptimization():
 
         origin_model.graph_def = self._tmp_graph_def
 
-        return origin_model
+        #Debug
+        tf.io.write_graph(
+            self._tmp_graph_def,
+            '/home/alexsu/work/projects/algo/nncf_tf/source/nncf-tf/lpot/examples/tensorflow/qat',
+            'fp32_post_optimized_model.pb',
+            as_text=False)
+        # exit()
+        return origin_model, fold_batchnorm_scales
 
     def get_matched_nodes(self, patterns):
         """Searche the matched nodes with the specified patterns

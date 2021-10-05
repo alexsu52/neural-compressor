@@ -87,7 +87,10 @@ class FoldBatchNormNodesOptimizer(GraphRewriterBase):
         target_nodes = cur_graph.query_fusion_pattern_nodes(
             [["Conv2D", "DepthwiseConv2dNative"], ("BiasAdd", "Add", "AddV2"),
              ["BatchNormWithGlobalNormalization", "FusedBatchNorm", "FusedBatchNormV3"]])
-        for node_combination in target_nodes:
+        scales = {}
+        for idx, node_combination in enumerate(target_nodes):
+            # if idx > -1:
+            #     break
             matched_node = node_combination[:-1]
             has_add_op = True if len(node_combination[-1]) == 3 else False
             conv_node = graph_info[Helper.node_name_from_input(matched_node[0])].node
@@ -178,6 +181,7 @@ class FoldBatchNormNodesOptimizer(GraphRewriterBase):
 
             offset_value = (-mean_value * scale_value) + beta_value
 
+            scales[conv_node.name] = scale_value
 
             if conv_node.op == "Conv2D":
                 original_shape =weights.shape
@@ -231,4 +235,6 @@ class FoldBatchNormNodesOptimizer(GraphRewriterBase):
             cur_graph.remove_node(beta_node_name)
             cur_graph.remove_node(gamma_node_name)
 
-        return cur_graph.dump_graph()
+        output_graph_def = cur_graph.dump_graph()
+
+        return output_graph_def, scales

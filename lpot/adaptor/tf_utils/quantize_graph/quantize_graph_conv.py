@@ -28,16 +28,13 @@ class FuseNodeStartWithConv2d(QuantizeNodeBase):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.sorted_patterns = sorted(self.patterns,
-                                      key=lambda i: len(i),
-                                      reverse=True)
         self.fusion_mapping = {
             'Conv2DBiasAdd': self.apply_conv_biasadd_fusion,
-            'Conv2DBiasAddAddNRelu': self.apply_conv_biasadd_addn_relu_fusion,
-            'Conv2DBiasAddAddNRelu6': self.apply_conv_biasadd_addn_relu_fusion,
-            'Conv2DBiasAddAddV2Relu': self.apply_conv_biasadd_addn_relu_fusion,
-            'Conv2DBiasAddAddV2Relu6': self.apply_conv_biasadd_addn_relu_fusion,
-            'Conv2DBiasAddAddRelu': self.apply_conv_biasadd_addn_relu_fusion,
+            # 'Conv2DBiasAddAddNRelu': self.apply_conv_biasadd_addn_relu_fusion,
+            # 'Conv2DBiasAddAddNRelu6': self.apply_conv_biasadd_addn_relu_fusion,
+            # 'Conv2DBiasAddAddV2Relu': self.apply_conv_biasadd_addn_relu_fusion,
+            # 'Conv2DBiasAddAddV2Relu6': self.apply_conv_biasadd_addn_relu_fusion,
+            '#Conv2DBiasAddAddRelu': self.apply_conv_biasadd_addn_relu_fusion,
             'Conv2DBiasAddRelu6': self.apply_conv_biasadd_relu_fusion,
             'Conv2DBiasAddRelu': self.apply_conv_biasadd_relu_fusion,
             'Conv2DBiasAddLeakyRelu': self.apply_conv_biasadd_relu_fusion,
@@ -51,6 +48,16 @@ class FuseNodeStartWithConv2d(QuantizeNodeBase):
             'Conv2D': self.apply_conv_single_fusion,
             'DepthwiseConv2dNative': self.apply_conv_single_fusion,
         }
+
+        sorted_patterns = sorted(self.patterns,
+                                      key=lambda i: len(i),
+                                      reverse=True)
+
+        self.sorted_patterns = []
+        for pattern in sorted_patterns:
+            fusion_name = ''.join(pattern)
+            if fusion_name in self.fusion_mapping:
+                self.sorted_patterns.append(pattern)
 
     def apply_conv_single_fusion(self, match_node_name):
         skip_node_name = match_node_name[1:]

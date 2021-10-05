@@ -16,11 +16,14 @@
 #  limitations under the License.
 #
 
+from collections import OrderedDict
+
 import copy
 import os
 import logging
 import tempfile
 import tensorflow as tf
+import numpy as np
 from tensorflow.core.framework import graph_pb2
 from tensorflow.python.framework import tensor_util
 from tensorflow.python.platform import gfile
@@ -60,6 +63,8 @@ from .graph_rewriter.int8.rnn_convert import QuantizedRNNConverter
 from .graph_rewriter.itex.itex_convert import GenerateITEXModel
 from lpot.adaptor.tf_utils.graph_rewriter.generic.insert_print_node import InsertPrintMinMaxNode
 from lpot.adaptor.tf_utils.graph_rewriter.graph_util import GraphRewriterHelper as Helper
+from lpot.adaptor.tf_utils.graph_rewriter.int8.remove_fake_quant import RemoveFakeQuantOpOptimizer
+from lpot.adaptor.tf_utils.quantize_graph.quantize_graph_common import QuantizeGraphHelper as helper
 
 
 TF_SUPPORTED_MAX_VERSION = '2.6.0'
@@ -78,7 +83,8 @@ class GraphConverter:
                  bf16_ops=[],
                  data_loader=None,
                  fake_quant=False,
-                 itex_mode=False):
+                 itex_mode=False,
+                 qat_model_parameters=None):
         """Convert graph.
 
         :param model: input tensorflow model.
@@ -137,6 +143,9 @@ class GraphConverter:
         self._itex_model.output_tensor_names = self.output_tensor_names
         self._itex_model.input_tensor_names = self.input_tensor_names
         self._tmp_graph_def = copy.deepcopy(self.model.graph_def)
+
+        self._qat_model_parameters = qat_model_parameters
+
     # pylint: disable=no-member
     def _inference(self, model):
         """Run the calibration on the input graph
@@ -516,6 +525,384 @@ class GraphConverter:
                 res[i[2]] += 1
         return [(i,) for i in res if res[i] == 2]
 
+    def remove_fake_quantize(self):
+        self._tmp_graph_def = RemoveFakeQuantOpOptimizer(
+            self._tmp_graph_def).do_transformation()
+
+        self._tmp_graph_def.library.CopyFrom(self.model.graph_def.library)
+        self._tmp_model.graph_def = self._tmp_graph_def
+
+        # Debug
+        import tensorflow as tf
+        tf.io.write_graph(
+            self._tmp_graph_def,
+                '/home/alexsu/work/projects/algo/nncf_tf/source/nncf-tf/lpot/examples/tensorflow/qat',
+            'fp32_remove_fake_model.pb',
+            as_text=False)
+
+    def _trace_graph(self, graph_def):
+        graph_analyzer = GraphAnalyzer()
+        graph_analyzer.graph = graph_def
+        graph_info = graph_analyzer.parse_graph()
+
+        trace = OrderedDict()
+
+        stack = []
+        for input_name in self.input_tensor_names:
+            stack.append(input_name)
+
+        visited = {}
+
+        while stack:
+            node_name = stack.pop()
+            node_info = graph_info[node_name]
+
+            if node_name in visited:
+                visited[node_name] += 1
+            else:
+                visited[node_name] = 1 if node_info.node.input else 0
+                for node_input in node_info.node.input:
+                    if node_input in graph_info:
+                        if graph_info[node_input].node.op == 'Const':
+                            visited[node_name] += 1
+                    else:
+                        visited[node_name] += 1
+
+            if visited[node_name] == len(node_info.node.input):
+                trace[node_name] = node_info
+                for output in node_info.outputs:
+                    stack.append(output)
+
+        return trace, graph_info
+
+    def find_next_fq_parameters(self, graph_info, graph_trace):
+        print('Find FQ parameters:')
+        while True:
+            node_name, node_info = graph_trace.popitem(last=False)
+            print(f'FP32_GRAPH:{node_name} | {node_info.node.op}')
+            if node_info.node.op in ['FakeQuantWithMinMaxVars']:
+                narrow_range = node_info.node.attr['narrow_range'].b
+                min_node = graph_info[node_info.node.input[1]].node
+                max_node = graph_info[node_info.node.input[2]].node
+                min_value = tensor_util.MakeNdarray(min_node.attr['value'].tensor)
+                max_value = tensor_util.MakeNdarray(max_node.attr['value'].tensor)
+                q_type = tf.dtypes.qint8 if np.min(min_value) < 0 else tf.dtypes.quint8
+
+                if q_type == tf.dtypes.qint8 and narrow_range == False:
+                    print('Warning: type qint8, narrow_range = False')
+
+                return min_value, max_value, q_type
+
+    def get_input_type(self, graph_info, node_name):
+        if graph_info[node_name].node.op in ['Requantize']:
+            q_type = tf.dtypes.as_dtype(graph_info[node_name].node.attr['out_type'].type)
+            min_node = graph_info[graph_info[node_name].node.input[3]].node
+            max_node = graph_info[graph_info[node_name].node.input[4]].node
+            min_value = tensor_util.MakeNdarray(min_node.attr['value'].tensor)
+            max_value = tensor_util.MakeNdarray(max_node.attr['value'].tensor)
+            return q_type, min_value, max_value
+
+        if graph_info[node_name].node.op in ['QuantizedMatMulWithBiasAndReluAndRequantize']:
+            q_type = tf.dtypes.as_dtype(graph_info[node_name].node.attr['Toutput'].type)
+            min_node = graph_info[graph_info[node_name].node.input[7]].node
+            max_node = graph_info[graph_info[node_name].node.input[8]].node
+            min_value = tensor_util.MakeNdarray(min_node.attr['value'].tensor)
+            max_value = tensor_util.MakeNdarray(max_node.attr['value'].tensor)
+            return q_type, min_value, max_value
+
+        if graph_info[node_name].node.op in ['QuantizedConv2DWithBiasAndReluAndRequantize',
+                                             'QuantizedConv2DWithBiasAndRequantize']:
+            q_type = tf.dtypes.as_dtype(graph_info[node_name].node.attr['out_type'].type)
+            min_node = graph_info[graph_info[node_name].node.input[7]].node
+            max_node = graph_info[graph_info[node_name].node.input[8]].node
+            min_value = tensor_util.MakeNdarray(min_node.attr['value'].tensor)
+            max_value = tensor_util.MakeNdarray(max_node.attr['value'].tensor)
+            return q_type, min_value, max_value
+
+        if graph_info[node_name].node.op in ['Quantize', 'QuantizeV2']:
+            q_type = tf.dtypes.as_dtype(graph_info[node_name].node.attr['T'].type)
+            min_node = graph_info[graph_info[node_name].node.input[1]].node
+            max_node = graph_info[graph_info[node_name].node.input[2]].node
+            min_value = tensor_util.MakeNdarray(min_node.attr['value'].tensor)
+            max_value = tensor_util.MakeNdarray(max_node.attr['value'].tensor)
+            return q_type, min_value, max_value
+
+        return self.get_input_type(graph_info, graph_info[node_name].node.input[0])
+
+    def _quantize(self, input, min_input, max_input, type):
+        with tf.Graph().as_default() as quantized_graph:
+            input_ = tf.compat.v1.placeholder(tf.float32, shape=input.shape, name='input')
+            min_input_ = tf.constant(min_input, dtype=tf.float32, shape=min_input.shape)
+            max_input_ = tf.constant(max_input, dtype=tf.float32, shape=max_input.shape)
+            narrow_range = type == tf.dtypes.qint8
+            q_input_, min_output_, max_output_ = tf.quantization.quantize(
+                input_,
+                min_input_,
+                max_input_,
+                type,
+                mode='SCALED',
+                round_mode='HALF_TO_EVEN',
+                narrow_range=narrow_range,
+                ensure_minimum_range=0.0)
+
+            with tf.compat.v1.Session(graph=quantized_graph) as sess:
+                out = sess.run(
+                    [q_input_, min_output_, max_output_], feed_dict={input_: input})
+
+                return tuple(out)
+
+    def _generate_int32_bias_for_matmul(self, bias_tensor, input_range, filter_range):
+        bias_scale = 255.0 * 127.0 / (input_range * filter_range)
+
+        int32_bias =np.around(bias_tensor * bias_scale).astype('int32')
+
+        return int32_bias
+
+
+    def _fill_qat_parameters(self):
+        quantized_graph_trace, quantized_graph_info = self._trace_graph(self._tmp_graph_def)
+        fp32_graph_trace, fp32_graph_info = self._trace_graph(self._qat_model_parameters['const_fold_graph_def'])
+
+        print('Fill QAT parameters:')
+        for node_name, node_info in quantized_graph_trace.items():
+            print(f'Q_GRAPH:{node_name} | {node_info.node.op}')
+            if node_info.node.op in ['Quantize', 'QuantizeV2']:
+                min, max, q_type = self.find_next_fq_parameters(
+                    fp32_graph_info,
+                    fp32_graph_trace)
+
+                min_node = quantized_graph_info[node_info.node.input[1]].node
+                max_node = quantized_graph_info[node_info.node.input[2]].node
+
+                helper.set_attr_dtype(node_info.node, "T", q_type)
+                helper.set_attr_string(node_info.node, "mode", b"SCALED")
+                helper.set_attr_string(node_info.node, "round_mode", b"HALF_TO_EVEN")
+                helper.set_attr_bool(node_info.node, "narrow_range", q_type == tf.dtypes.qint8)
+                helper.set_attr_float(node_info.node, "ensure_minimum_range", 0.0)
+
+                helper.set_attr_dtype(min_node, "dtype", tf.dtypes.float32)
+                helper.set_attr_tensor(min_node, "value", min, tf.dtypes.float32, min.shape)
+                helper.set_attr_dtype(max_node, "dtype", tf.dtypes.float32)
+                helper.set_attr_tensor(max_node, "value", max, tf.dtypes.float32, max.shape)
+
+
+            if node_info.node.op in ['Requantize']:
+                min, max, q_type = self.find_next_fq_parameters(
+                    fp32_graph_info,
+                    fp32_graph_trace)
+
+                min_node = quantized_graph_info[node_info.node.input[3]].node
+                max_node = quantized_graph_info[node_info.node.input[4]].node
+
+                helper.set_attr_dtype(node_info.node, "out_type", q_type)
+
+                helper.set_attr_dtype(min_node, "dtype", tf.dtypes.float32)
+                helper.set_attr_tensor(min_node, "value", min, tf.dtypes.float32, min.shape)
+                helper.set_attr_dtype(max_node, "dtype", tf.dtypes.float32)
+                helper.set_attr_tensor(max_node, "value", max, tf.dtypes.float32, max.shape)
+
+            if node_info.node.op in ['QuantizedConv2DWithBiasAndRelu',
+                                     'QuantizedConv2DWithBiasAndReluAndRequantize',
+                                     'QuantizedConv2DWithBias',
+                                     'QuantizedConv2DWithBiasAndRequantize']:
+                q_input_type, min_input, max_input = self.get_input_type(quantized_graph_info, node_info.node.input[0])
+                helper.set_attr_dtype(node_info.node, "Tinput", q_input_type)
+                helper.set_attr_dtype(node_info.node, "Tfilter", tf.dtypes.qint8)
+                helper.set_attr_dtype(node_info.node, "Tbias", tf.dtypes.float32)
+
+                conv_name = node_info.node.name.replace('_eightbit_quantized_conv', '')
+                conv_name = conv_name.replace('_eightbit_requantize', '')
+                filter = self._qat_model_parameters['conv_weights'][conv_name]
+                min_filter = self._qat_model_parameters['fq_weights'][conv_name]['min']
+                max_filter = self._qat_model_parameters['fq_weights'][conv_name]['max']
+                print(f'{conv_name} : min {min_filter}, max {max_filter}')
+                q_filter, q_min, q_max = self._quantize(filter, min_filter, max_filter, tf.dtypes.qint8)
+                bias = self._qat_model_parameters['bias_adds'][conv_name]
+                if conv_name in self._qat_model_parameters['scales']:
+                    scale = self._qat_model_parameters['scales'][conv_name]
+                    min_scaled_filter = min_filter * scale
+                    max_scaled_filter = max_filter * scale
+                else:
+                    min_scaled_filter = min_filter
+                    max_scaled_filter = max_filter
+
+                filter_node = quantized_graph_info[node_info.node.input[1]].node
+                bias_node = quantized_graph_info[node_info.node.input[2]].node
+                min_filter_node = quantized_graph_info[node_info.node.input[5]].node
+                max_filter_node = quantized_graph_info[node_info.node.input[6]].node
+
+                helper.set_attr_dtype(filter_node, "dtype", tf.dtypes.qint8)
+                helper.set_attr_tensor(filter_node, "value", q_filter, tf.dtypes.qint8, q_filter.shape)
+
+                helper.set_attr_dtype(bias_node, "dtype", tf.dtypes.float32)
+                helper.set_attr_tensor(bias_node, "value", bias, tf.dtypes.float32, bias.shape)
+
+                helper.set_attr_dtype(min_filter_node, "dtype", tf.dtypes.float32)
+                helper.set_attr_tensor(min_filter_node, "value", min_scaled_filter, tf.dtypes.float32, min_scaled_filter.shape)
+
+                helper.set_attr_dtype(max_filter_node, "dtype", tf.dtypes.float32)
+                helper.set_attr_tensor(max_filter_node, "value", max_scaled_filter, tf.dtypes.float32, max_scaled_filter.shape)
+
+                if node_info.node.op in ['QuantizedConv2DWithBiasAndReluAndRequantize',
+                                         'QuantizedConv2DWithBiasAndRequantize']:
+                    re_min, re_max, req_type = self.find_next_fq_parameters(
+                        fp32_graph_info,
+                        fp32_graph_trace)
+
+                    helper.set_attr_dtype(node_info.node, "out_type", req_type)
+
+                    min_freezed_output = quantized_graph_info[node_info.node.input[7]].node
+                    max_freezed_output = quantized_graph_info[node_info.node.input[8]].node
+
+                    helper.set_attr_dtype(min_freezed_output, "dtype", tf.dtypes.float32)
+                    helper.set_attr_tensor(min_freezed_output, "value", re_min, tf.dtypes.float32,
+                                           re_min.shape)
+
+                    helper.set_attr_dtype(max_freezed_output, "dtype", tf.dtypes.float32)
+                    helper.set_attr_tensor(max_freezed_output, "value", re_max, tf.dtypes.float32,
+                                           re_max.shape)
+
+            if node_info.node.op in ['QuantizedMatMulWithBias',
+                                     'QuantizedMatMulWithBiasAndReluAndRequantize']:
+                q_input_type, min_input, max_input = self.get_input_type(quantized_graph_info, node_info.node.input[0])
+                helper.set_attr_dtype(node_info.node, "T1", q_input_type)
+                helper.set_attr_dtype(node_info.node, "T2", tf.dtypes.qint8)
+                helper.set_attr_dtype(node_info.node, "Tbias", tf.dtypes.float32)
+                helper.set_attr_string(node_info.node, "input_quant_mode", b"SCALED")
+
+                matmul_name = node_info.node.name.replace('_eightbit_quantized_mat_mul', '')
+                matmul_name = matmul_name.replace('_eightbit_requantize', '')
+                b = self._qat_model_parameters['mat_weights'][matmul_name]
+                min_filter = self._qat_model_parameters['fq_weights'][matmul_name]['min']
+                max_filter = self._qat_model_parameters['fq_weights'][matmul_name]['max']
+                print(f'{matmul_name} : min {min_filter}, max {max_filter}')
+                q_b, q_min, q_max = self._quantize(b, min_filter, max_filter, tf.dtypes.qint8)
+
+                bias = self._qat_model_parameters['bias_adds'][matmul_name]
+
+                b_node = quantized_graph_info[node_info.node.input[1]].node
+                bias_node = quantized_graph_info[node_info.node.input[2]].node
+                min_b_node = quantized_graph_info[node_info.node.input[5]].node
+                max_b_node = quantized_graph_info[node_info.node.input[6]].node
+
+                helper.set_attr_dtype(bias_node, "dtype", tf.dtypes.float32)
+                helper.set_attr_tensor(bias_node, "value", bias, tf.dtypes.float32, bias.shape)
+
+                helper.set_attr_dtype(b_node, "dtype", tf.dtypes.qint8)
+                helper.set_attr_tensor(b_node, "value", q_b, tf.dtypes.qint8, q_b.shape)
+
+                helper.set_attr_dtype(min_b_node, "dtype", tf.dtypes.float32)
+                helper.set_attr_tensor(min_b_node, "value", min_filter, tf.dtypes.float32,
+                                       min_filter.shape)
+
+                helper.set_attr_dtype(max_b_node, "dtype", tf.dtypes.float32)
+                helper.set_attr_tensor(max_b_node, "value", max_filter, tf.dtypes.float32,
+                                       max_filter.shape)
+
+                if node_info.node.op in ['QuantizedMatMulWithBiasAndReluAndRequantize']:
+                    re_min, re_max, req_type = self.find_next_fq_parameters(
+                        fp32_graph_info,
+                        fp32_graph_trace)
+
+                    helper.set_attr_dtype(node_info.node, "Toutput", req_type)
+
+                    min_freezed_output = quantized_graph_info[node_info.node.input[7]].node
+                    max_freezed_output = quantized_graph_info[node_info.node.input[8]].node
+
+                    helper.set_attr_dtype(min_freezed_output, "dtype", tf.dtypes.float32)
+                    helper.set_attr_tensor(min_freezed_output, "value", re_min, tf.dtypes.float32,
+                                           re_min.shape)
+
+                    helper.set_attr_dtype(max_freezed_output, "dtype", tf.dtypes.float32)
+                    helper.set_attr_tensor(max_freezed_output, "value", re_max, tf.dtypes.float32,
+                                           re_max.shape)
+
+                    if q_input_type != tf.quint8:
+                        raise RuntimeError(f'Input type is tf.qint8 for {node_info.node.name}. tf.quint8 is expected')
+                    filter_range = np.maximum(np.abs(min_filter), np.abs(max_filter))
+                    input_range = max_input
+                    bias_int32 = self._generate_int32_bias_for_matmul(bias, input_range, filter_range)
+
+                    helper.set_attr_dtype(node_info.node, "Tbias", tf.dtypes.qint32)
+                    helper.set_attr_dtype(bias_node, "dtype", tf.dtypes.qint32)
+                    helper.set_attr_tensor(bias_node, "value", bias_int32, tf.dtypes.qint32, bias_int32.shape)
+
+        self._tmp_graph_def.library.CopyFrom(self.model.graph_def.library)
+
+        self._tmp_model.graph_def = self._tmp_graph_def
+
+        # Debug
+        tf.io.write_graph(
+            self._tmp_graph_def,
+            '/home/alexsu/work/projects/algo/nncf_tf/source/nncf-tf/lpot/examples/tensorflow/qat',
+            'fill_qat_parameters.pb',
+            as_text=False)
+
+    def _fuse_requantize(self):
+        self._tmp_graph_def = FuseConvRequantizeTransformer(
+            self._tmp_graph_def,
+            self.device).do_transformation()
+
+        self._tmp_graph_def = FuseMatMulRequantizeTransformer(
+            self._tmp_graph_def).do_transformation()
+
+        self._tmp_graph_def.library.CopyFrom(self.model.graph_def.library)
+
+        self._tmp_model.graph_def = self._tmp_graph_def
+
+        # Debug
+        import tensorflow as tf
+        tf.io.write_graph(
+            self._tmp_graph_def,
+            '/home/alexsu/work/projects/algo/nncf_tf/source/nncf-tf/lpot/examples/tensorflow/qat',
+            'fuse_requantize.pb',
+            as_text=False)
+
+    def _qat_fuse_requantize_with_fused_quantized_node(self):
+        pass
+
+        # if not self.fake_quant:
+        #     self._tmp_graph_def = FuseMatMulRequantizeTransformer(
+        #         self._tmp_graph_def).do_transformation()
+        #
+        #     self._tmp_graph_def = FuseMatMulRequantizeDequantizeTransformer(
+        #         self._tmp_graph_def).do_transformation()
+        # self._tmp_graph_def = StripUnusedNodesOptimizer(
+        #     self._tmp_graph_def,
+        #     self._tmp_model.input_node_names,
+        #     self._tmp_model.output_node_names).do_transformation()
+        #
+        # self._tmp_graph_def = RemoveTrainingNodesOptimizer(
+        #     self._tmp_graph_def,
+        #     protected_nodes=self._tmp_model.output_node_names).do_transformation()
+        #
+        # # self._tmp_graph_def = FoldBatchNormNodesOptimizer(
+        # #     self._tmp_graph_def).do_transformation()
+        #
+        # if 'scale_propagation_concat' in self.recipes and self.recipes['scale_propagation_concat']:
+        #     self._tmp_graph_def = RerangeQuantizedConcat(self._tmp_graph_def,
+        #                                              self.device).do_transformation()
+        #
+        # self._tmp_graph_def = MetaInfoChangingMemOpOptimizer(
+        #     self._tmp_graph_def).do_transformation()
+        #
+        # if self.advance_config is not None and \
+        #    deep_get(self.advance_config, 'bias_correction') is not None:
+        #     self._tmp_graph_def = BiasCorrection(
+        #         self._tmp_graph_def, self.model.graph_def).do_transformation()
+
+        self._tmp_graph_def.library.CopyFrom(self.model.graph_def.library)
+
+        self._tmp_model.graph_def = self._tmp_graph_def
+
+        #Debug
+        import tensorflow as tf
+        tf.io.write_graph(
+            self._tmp_graph_def,
+            '/home/alexsu/work/projects/algo/nncf_tf/source/nncf-tf/lpot/examples/tensorflow/qat',
+            'int8_fused_quantized_model.pb',
+            as_text=False)
+
     def quantize(self):
         """Quantize graph only (without optimizing fp32 graph), including:
             1) quantize graph,
@@ -525,13 +912,18 @@ class GraphConverter:
         :return:
         """
         try:
+            if self.fake_quant:
+                self.remove_fake_quantize()
+
             self._quantize_graph()
             self._rnn_details = self._analysis_rnn_model()
             self.quantized_node_info.extend(self._rnn_details.keys())
             self.quantized_node_info = [tuple(i) for i in self.quantized_node_info]
 
             if self.fake_quant:
-                self._fuse_requantize_with_fused_quantized_node()
+                self._fuse_requantize()
+                self._fill_qat_parameters()
+                #self._qat_fuse_requantize_with_fused_quantized_node()
             else:
                 if self._enable_kl_op_names:
                     self._get_fp32_print_node_names(self._enable_kl_op_names)
@@ -550,6 +942,15 @@ class GraphConverter:
                     sampling_graph_def, output_names = InsertPrintMinMaxNode(
                         sampling_graph_def, i[0], i[-1], frame_name).do_transformation()
                     output_tensor_names.extend(output_names)
+
+                # Debug
+                import tensorflow as tf
+                tf.io.write_graph(
+                    sampling_graph_def,
+                    '/home/alexsu/work/projects/algo/nncf_tf/source/nncf-tf/lpot/examples/tensorflow/qat',
+                    'sampling_model.pb',
+                    as_text=False)
+
                 if self.quantized_node_info:
                     sampling_graph_def.library.CopyFrom(self.model.graph_def.library)
                     self._sampling_model.graph_def = sampling_graph_def
@@ -603,6 +1004,14 @@ class GraphConverter:
         """quantize graph."""
 
         non_pad_ops = list(list(set(self.fp32_ops).union(set(self.bf16_ops))))
+
+        #Debug
+        import tensorflow as tf
+        tf.io.write_graph(
+            self._tmp_graph_def,
+            '/home/alexsu/work/projects/algo/nncf_tf/source/nncf-tf/lpot/examples/tensorflow/qat',
+            'fp32_pre_quantized_model.pb',
+            as_text=False)
 
         self._tmp_graph_def = FusePadWithConv2DOptimizer(
             self._tmp_graph_def,
@@ -712,8 +1121,8 @@ class GraphConverter:
             self._tmp_graph_def,
             protected_nodes=self._tmp_model.output_node_names).do_transformation()
 
-        self._tmp_graph_def = FoldBatchNormNodesOptimizer(
-            self._tmp_graph_def).do_transformation()
+        # self._tmp_graph_def = FoldBatchNormNodesOptimizer(
+        #     self._tmp_graph_def).do_transformation()
 
         if 'scale_propagation_concat' in self.recipes and self.recipes['scale_propagation_concat']:
             self._tmp_graph_def = RerangeQuantizedConcat(self._tmp_graph_def,
@@ -730,6 +1139,14 @@ class GraphConverter:
         self._tmp_graph_def.library.CopyFrom(self.model.graph_def.library)
 
         self._tmp_model.graph_def = self._tmp_graph_def
+
+        #Debug
+        import tensorflow as tf
+        tf.io.write_graph(
+            self._tmp_graph_def,
+            '/home/alexsu/work/projects/algo/nncf_tf/source/nncf-tf/lpot/examples/tensorflow/qat',
+            'int8_fused_quantized_model.pb',
+            as_text=False)
 
     def _post_clean(self):
         """Delete the temporarily files generated during the quantization process.

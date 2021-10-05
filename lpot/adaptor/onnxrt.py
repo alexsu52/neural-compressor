@@ -462,7 +462,7 @@ class ONNXRTAdaptor(Adaptor):
             op_wise.update(
                 {(op.name, op.op_type): copy.deepcopy(op_capability)})
 
-        return {'optypewise': optype_wise, 'opwise': op_wise}
+        return {'optypewise': optype_wise, 'opwise': op_wise}, None, None
 
     def _cfg_to_quantize_config(self, tune_cfg):
         quantize_config = {}
