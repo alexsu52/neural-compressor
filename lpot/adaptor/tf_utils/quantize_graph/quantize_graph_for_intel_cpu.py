@@ -82,6 +82,8 @@ class QuantizeGraphForIntel(QuantizeGraphBase):
             if node in self.input_graph.node and node.op in self.transformers \
                 and node.name in self.op_wise_config:
                 # count += 1
+                # if count > 0:
+                #     break
                 # if count == all_node_length:
                 #     remove_redundant_quant_flag = True
 

@@ -118,8 +118,11 @@
     int8: [
         'Conv2D + BiasAdd',
         'Conv2D + BiasAdd + Relu',
-        'Conv2D + BiasAdd + Relu6'
-        ]
+        'Conv2D + BiasAdd + Relu6',
+        'Conv2D + Mul + BiasAdd',
+        'Conv2D + Mul + BiasAdd + Relu',
+        'Conv2D + Mul + BiasAdd + Relu6'
+    ]
     uint8: [
         'Conv2D + BiasAdd + AddN + Relu',
         'Conv2D + BiasAdd + AddN + Relu6',
@@ -139,7 +142,25 @@
         'DepthwiseConv2dNative + BiasAdd',
         'MatMul + BiasAdd + Relu',
         'MatMul + BiasAdd',
-  ]
+        'Conv2D + Mul + BiasAdd + AddN + Relu',
+        'Conv2D + Mul + BiasAdd + AddN + Relu6',
+        'Conv2D + Mul + BiasAdd + AddV2 + Relu',
+        'Conv2D + Mul + BiasAdd + AddV2 + Relu6',
+        'Conv2D + Mul + BiasAdd + Add + Relu',
+        'Conv2D + Mul + BiasAdd + Add + Relu6',
+        'Conv2D + Mul + BiasAdd + Relu',
+        'Conv2D + Mul + BiasAdd + Relu6',
+        'Conv2D + Mul + Add + Relu',
+        'Conv2D + Mul + Add + Relu6',
+        'Conv2D + Mul + Relu',
+        'Conv2D + Mul + Relu6',
+        'Conv2D + Mul + BiasAdd',
+        'DepthwiseConv2dNative + Mul + BiasAdd + Relu6',
+        'DepthwiseConv2dNative + Mul + Add + Relu6',
+        'DepthwiseConv2dNative + Mul + BiasAdd',
+        'MatMul + Mul + BiasAdd + Relu',
+        'MatMul + Mul + BiasAdd'
+    ]
 
   grappler_optimization: &common_grappler_optimization
     pruning: True                                    # optional. grappler pruning optimizer,default value is True.
@@ -256,7 +277,12 @@
       'Conv2D + BiasAdd + Relu',
       'Conv2D + BiasAdd + LeakyRelu',
       'Conv2D + BiasAdd + LeakyRelu + AddV2',
-      'Conv2D + BiasAdd + Relu6']
+      'Conv2D + BiasAdd + Relu6',
+      'Conv2D + Mul + BiasAdd',
+      'Conv2D + Mul + BiasAdd + Relu',
+      'Conv2D + Mul + BiasAdd + LeakyRelu',
+      'Conv2D + Mul + BiasAdd + LeakyRelu + AddV2',
+      'Conv2D + Mul + BiasAdd + Relu6']
     uint8: [
         'Conv2D + BiasAdd + AddN + Relu',
         'Conv2D + BiasAdd + AddN + Relu6',
@@ -276,6 +302,24 @@
         'DepthwiseConv2dNative + BiasAdd',
         'MatMul + BiasAdd + Relu',
         'MatMul + BiasAdd',
+        'Conv2D + Mul + BiasAdd + AddN + Relu',
+        'Conv2D + Mul + BiasAdd + AddN + Relu6',
+        'Conv2D + Mul + BiasAdd + AddV2 + Relu',
+        'Conv2D + Mul + BiasAdd + AddV2 + Relu6',
+        'Conv2D + Mul + BiasAdd + Add + Relu',
+        'Conv2D + Mul + BiasAdd + Add + Relu6',
+        'Conv2D + Mul + BiasAdd + Relu',
+        'Conv2D + Mul + BiasAdd + Relu6',
+        'Conv2D + Mul + Add + Relu',
+        'Conv2D + Mul + Add + Relu6',
+        'Conv2D + Mul + Relu',
+        'Conv2D + Mul + Relu6',
+        'Conv2D + Mul + BiasAdd',
+        'DepthwiseConv2dNative + Mul + BiasAdd + Relu6',
+        'DepthwiseConv2dNative + Mul + Add + Relu6',
+        'DepthwiseConv2dNative + Mul + BiasAdd',
+        'MatMul + Mul + BiasAdd + Relu',
+        'MatMul + Mul + BiasAdd'
   ]
 
   grappler_optimization:
@@ -351,7 +395,9 @@
         ]
     int8: [
         'MatMul + BiasAdd + Relu',
-        'MatMul + BiasAdd'
+        'MatMul + BiasAdd',
+        'MatMul + Mul + BiasAdd + Relu',
+        'MatMul + Mul + BiasAdd'
         ]
     uint8: [
         'Conv2D + BiasAdd + AddN + Relu',
@@ -372,7 +418,25 @@
         'DepthwiseConv2dNative + BiasAdd',
         'MatMul + BiasAdd + Relu',
         'MatMul + BiasAdd',
-  ]
+        'Conv2D + Mul + BiasAdd + AddN + Relu',
+        'Conv2D + Mul + BiasAdd + AddN + Relu6',
+        'Conv2D + Mul + BiasAdd + AddV2 + Relu',
+        'Conv2D + Mul + BiasAdd + AddV2 + Relu6',
+        'Conv2D + Mul + BiasAdd + Add + Relu',
+        'Conv2D + Mul + BiasAdd + Add + Relu6',
+        'Conv2D + Mul + BiasAdd + Relu',
+        'Conv2D + Mul + BiasAdd + Relu6',
+        'Conv2D + Mul + Add + Relu',
+        'Conv2D + Mul + Add + Relu6',
+        'Conv2D + Mul + Relu',
+        'Conv2D + Mul + Relu6',
+        'Conv2D + Mul + BiasAdd',
+        'DepthwiseConv2dNative + Mul + BiasAdd + Relu6',
+        'DepthwiseConv2dNative + Mul + Add + Relu6',
+        'DepthwiseConv2dNative + Mul + BiasAdd',
+        'MatMul + Mul + BiasAdd + Relu',
+        'MatMul + Mul + BiasAdd'
+    ]
 
   grappler_optimization: &default_grappler_optimization
     pruning: True                                   # optional. grappler pruning optimizer,default value is False.

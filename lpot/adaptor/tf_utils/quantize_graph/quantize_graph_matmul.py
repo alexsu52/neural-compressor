@@ -36,6 +36,9 @@ class FuseNodeStartWithMatmul(QuantizeNodeBase):
         self.fusion_mapping = {
             'MatMulBiasAdd': self.apply_matmul_biasadd_fusion,
             'MatMulBiasAddRelu': self.apply_matmul_biasadd_relu_fusion,
+            # + MUL
+            'MatMulMulBiasAdd': self.apply_matmul_biasadd_fusion,
+            'MatMulMulBiasAddRelu': self.apply_matmul_biasadd_relu_fusion,
         }
 
     def apply_matmul_biasadd_relu_fusion(self, match_node_name):

@@ -704,7 +704,8 @@ class GraphConverter:
             if node_info.node.op in ['QuantizedConv2DWithBiasAndRelu',
                                      'QuantizedConv2DWithBiasAndReluAndRequantize',
                                      'QuantizedConv2DWithBias',
-                                     'QuantizedConv2DWithBiasAndRequantize']:
+                                     'QuantizedConv2DWithBiasAndRequantize',
+                                     'QuantizedDepthwiseConv2DWithBiasAndReluAndRequantize']:
                 q_input_type, min_input, max_input = self.get_input_type(quantized_graph_info, node_info.node.input[0])
                 helper.set_attr_dtype(node_info.node, "Tinput", q_input_type)
                 helper.set_attr_dtype(node_info.node, "Tfilter", tf.dtypes.qint8)
@@ -720,6 +721,20 @@ class GraphConverter:
                 bias = self._qat_model_parameters['bias_adds'][conv_name]
                 if conv_name in self._qat_model_parameters['scales']:
                     scale = self._qat_model_parameters['scales'][conv_name]
+
+                    #remove negative scales
+                    negative_mul = np.ones(scale.shape, dtype=np.int8)
+                    negative_mul[np.where(scale < 0)] = -1
+                    if node_info.node.op in ['QuantizedDepthwiseConv2DWithBiasAndReluAndRequantize']:
+                        orig_shape = q_filter.shape
+                        req_filter = np.reshape(q_filter, (orig_shape[0], orig_shape[1], orig_shape[2] * orig_shape[3]))
+                        req_filter = req_filter * negative_mul
+                        q_filter = np.reshape(req_filter, orig_shape)
+                    else:
+                        q_filter = q_filter * negative_mul
+
+                    scale[np.where(scale < 0)] *= -1.0
+
                     min_scaled_filter = min_filter * scale
                     max_scaled_filter = max_filter * scale
                 else:
@@ -744,7 +759,8 @@ class GraphConverter:
                 helper.set_attr_tensor(max_filter_node, "value", max_scaled_filter, tf.dtypes.float32, max_scaled_filter.shape)
 
                 if node_info.node.op in ['QuantizedConv2DWithBiasAndReluAndRequantize',
-                                         'QuantizedConv2DWithBiasAndRequantize']:
+                                         'QuantizedConv2DWithBiasAndRequantize',
+                                         'QuantizedDepthwiseConv2DWithBiasAndReluAndRequantize']:
                     re_min, re_max, req_type = self.find_next_fq_parameters(
                         fp32_graph_info,
                         fp32_graph_trace)

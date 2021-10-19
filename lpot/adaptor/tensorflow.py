@@ -192,8 +192,17 @@ class TensorFlowAdaptor(Adaptor):
         origin_output_tensor_names = model.output_tensor_names
         model.output_tensor_names = outputs
         input_tensor = model.input_tensor
-        output_tensor = model.output_tensor if len(model.output_tensor)>1 else \
+
+        # Turn off any optimization
+        model_output_tensors = []
+        for op in model.graph.get_operations():
+            if not op.inputs:
+                continue
+            model_output_tensors.append(op.inputs[0])
+
+        output_t = model.output_tensor if len(model.output_tensor)>1 else \
                             model.output_tensor[0]
+        output_tensor = [output_t] + model_output_tensors
         logger.info("Start to evaluate the TensorFlow model.")
         for idx, (inputs, labels) in enumerate(dataloader):
             # dataloader should keep the order and len of inputs same with input_tensor
@@ -210,9 +219,11 @@ class TensorFlowAdaptor(Adaptor):
             elif measurer is not None:
                 measurer.start()
                 predictions = model.sess.run(output_tensor, feed_dict)
+                predictions = predictions[0]
                 measurer.end()
             else:
                 predictions = model.sess.run(output_tensor, feed_dict)
+                predictions = predictions[0]
 
             if self.fp32_preds_as_label:
                 self.fp32_results.append(predictions) if fp32_baseline else \
@@ -487,8 +498,18 @@ class TensorFlowAdaptor(Adaptor):
         biasadds = {}
         with sess.as_default():
             for op in graph.get_operations():
-                if op.type == 'BiasAdd':
-                    biasadds[op.inputs[0].op.name] = op.inputs[1].eval()
+                if op.type in ['Conv2D', 'MatMul', 'DepthwiseConv2dNative']:
+                    consumer = op.outputs[0].consumers()
+                    if len(consumer) > 1:
+                        continue
+
+                    if consumer[0].type == 'Mul':
+                        consumer = consumer[0].outputs[0].consumers()
+                        if len(consumer) > 1:
+                            continue
+
+                    if consumer[0].type == 'BiasAdd':
+                        biasadds[op.name] = consumer[0].inputs[1].eval()
         return biasadds
 
     def query_fw_capability(self, model):
@@ -530,7 +551,8 @@ class TensorFlowAdaptor(Adaptor):
 
             if not self.pre_optimizer_handle.has_positive_input(i[0]) and \
                 not check_match(self.query_handler.get_fuse_patterns()['int8'], i[-1]):
-                matched_nodes.remove(i)
+                print(f'Try to remove {i}')
+                #matched_nodes.remove(i)
 
         del copied_matched_nodes
 
@@ -818,13 +840,13 @@ class TensorFlowAdaptor(Adaptor):
                     consumer = op.outputs[0].consumers()
                     if len(consumer) > 1:
                         continue
-                    if consumer[0].type in ['Conv2D', 'MatMul']:
+                    if consumer[0].type in ['Conv2D', 'MatMul', 'DepthwiseConv2dNative']:
                         if consumer[0].inputs[1].name == op.outputs[0].name:
                             fq_weights[consumer[0].name] = {
                                 'min': op.inputs[1].eval(),
                                 'max': op.inputs[2].eval(),
                             }
-                if op.type == 'Conv2D':
+                if op.type in ['Conv2D', 'DepthwiseConv2dNative']:
                     conv_weights[op.name] = op.inputs[1].eval()
 
                 if op.type == 'MatMul':
